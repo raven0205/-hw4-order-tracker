@@ -1,0 +1,12 @@
+apiVersion: 1
+
+contactPoints:
+  - orgId: 1
+    name: incident-response
+    receivers:
+      - uid: incident-response-webhook
+        type: webhook
+        settings:
+          url: http://incident-response:8001/alerts
+          httpMethod: POST
+        disableResolveMessage: false

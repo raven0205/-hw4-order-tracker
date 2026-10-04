@@ -1,0 +1,64 @@
+apiVersion: 1
+
+groups:
+  - orgId: 1
+    name: order-api
+    folder: Order Tracker
+    interval: 1m
+    rules:
+      - uid: order-lookup-5xx
+        title: Order lookup 5xx responses
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: prometheus
+            model:
+              datasource:
+                type: prometheus
+                uid: prometheus
+              editorMode: code
+              expr: sum(increase(order_lookup_requests_total{http_response_status_code=~"5.."}[5m])) or vector(0)
+              instant: true
+              intervalMs: 1000
+              maxDataPoints: 43200
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator:
+                    params: [0]
+                    type: gt
+                  operator:
+                    type: and
+                  query:
+                    params: [B]
+                  reducer:
+                    params: []
+                    type: last
+                  type: query
+              datasource:
+                type: __expr__
+                uid: __expr__
+              expression: A
+              refId: B
+              type: threshold
+        dashboardUid: order-tracker-observability
+        panelId: 1
+        noDataState: OK
+        execErrState: Error
+        for: 1m
+        annotations:
+          summary: 5xx response from GET /api/orders/{order_id}
+          description: More than zero 5xx responses for GET /api/orders/{order_id} in the last 5 minutes.
+          endpoint: GET /api/orders/{order_id}
+          time_window: 5m
+          dashboard_url: http://localhost:3000/d/order-tracker-observability?orgId=1&viewPanel=1
+        labels:
+          severity: warning
