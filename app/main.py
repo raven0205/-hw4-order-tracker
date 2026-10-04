@@ -1,5 +1,7 @@
+import logging
 import os
 import sqlite3
+import sys
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -7,11 +9,68 @@ from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
+from opentelemetry import metrics, trace
+from opentelemetry._logs import set_logger_provider
+from opentelemetry.exporter.otlp.proto.grpc._log_exporter import OTLPLogExporter
+from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.instrumentation.logging import LoggingInstrumentor
+from opentelemetry.sdk._logs import LoggerProvider
+from opentelemetry.sdk._logs.export import (
+    BatchLogRecordProcessor,
+    ConsoleLogRecordExporter,
+    SimpleLogRecordProcessor,
+)
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import ConsoleMetricExporter, PeriodicExportingMetricReader
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import (
+    BatchSpanProcessor,
+    ConsoleSpanExporter,
+    SimpleSpanProcessor,
+)
+from opentelemetry.trace import Status, StatusCode
 from pydantic import BaseModel, Field
 
 
 DB_PATH = Path(os.getenv("ORDER_DB_PATH", "data/orders.db"))
 STATUSES = {"received", "preparing", "shipped", "delivered"}
+resource = Resource.create(
+    {"service.name": os.getenv("OTEL_SERVICE_NAME", "order-tracker")}
+)
+
+if os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT"):
+    metric_exporter = OTLPMetricExporter()
+    span_processor = BatchSpanProcessor(OTLPSpanExporter())
+    log_processor = BatchLogRecordProcessor(OTLPLogExporter())
+else:
+    metric_exporter = ConsoleMetricExporter(out=sys.__stdout__)
+    span_processor = SimpleSpanProcessor(ConsoleSpanExporter())
+    log_processor = SimpleLogRecordProcessor(ConsoleLogRecordExporter())
+
+metric_reader = PeriodicExportingMetricReader(
+    metric_exporter, export_interval_millis=5000
+)
+metrics.set_meter_provider(MeterProvider(resource=resource, metric_readers=[metric_reader]))
+meter = metrics.get_meter("order_tracker")
+lookup_requests = meter.create_counter(
+    "order.lookup.requests",
+    unit="{request}",
+    description="Order lookup requests by route and HTTP status",
+)
+
+tracer_provider = TracerProvider(resource=resource)
+tracer_provider.add_span_processor(span_processor)
+trace.set_tracer_provider(tracer_provider)
+tracer = trace.get_tracer("order_tracker")
+
+logger_provider = LoggerProvider(resource=resource)
+logger_provider.add_log_record_processor(log_processor)
+set_logger_provider(logger_provider)
+LoggingInstrumentor().instrument(log_handler_level=logging.INFO)
+otel_logger = logging.getLogger("order_tracker.lookup")
+otel_logger.setLevel(logging.INFO)
 
 
 def connect():
@@ -55,7 +114,7 @@ def order_detail(row):
     order = as_dict(row)
     if order["priority"] == "express":
         placed_at = datetime.fromisoformat(order["created_at"])
-        estimated_at = placed_at.replace(day=placed_at.day + 2)
+        estimated_at = placed_at + timedelta(days=2)
         order["estimated_delivery"] = estimated_at.date().isoformat()
     return order
 
@@ -79,6 +138,29 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(title="Order Tracker", lifespan=lifespan)
 
 
+def record_lookup_request(request, status_code):
+    route = request.scope.get("route")
+    if request.method == "GET" and getattr(route, "path", None) == "/api/orders/{order_id}":
+        lookup_requests.add(
+            1,
+            {
+                "http.route": route.path,
+                "http.response.status_code": status_code,
+            },
+        )
+
+
+@app.middleware("http")
+async def record_order_lookup_requests(request, call_next):
+    try:
+        response = await call_next(request)
+    except Exception:
+        record_lookup_request(request, 500)
+        raise
+    record_lookup_request(request, response.status_code)
+    return response
+
+
 @app.get("/")
 def index():
     return FileResponse(Path(__file__).parent.parent / "static" / "index.html")
@@ -100,11 +182,34 @@ def list_orders():
 
 @app.get("/api/orders/{order_id}")
 def get_order(order_id: str):
-    with connect() as db:
-        row = db.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
-    if row is None:
-        raise HTTPException(404, "Order not found")
-    return order_detail(row)
+    with tracer.start_as_current_span("order.lookup") as span:
+        span.set_attribute("http.request.method", "GET")
+        span.set_attribute("http.route", "/api/orders/{order_id}")
+        span.set_attribute("order.id", order_id)
+        with connect() as db:
+            row = db.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
+        if row is None:
+            span.set_attribute("order.lookup.found", False)
+            span.set_status(Status(StatusCode.ERROR, "Order not found"))
+            otel_logger.warning(
+                "Order lookup completed",
+                extra={
+                    "order.id": order_id,
+                    "order.lookup.found": False,
+                    "http.response.status_code": 404,
+                },
+            )
+            raise HTTPException(404, "Order not found")
+        span.set_attribute("order.lookup.found", True)
+        otel_logger.info(
+            "Order lookup completed",
+            extra={
+                "order.id": order_id,
+                "order.lookup.found": True,
+                "http.response.status_code": 200,
+            },
+        )
+        return order_detail(row)
 
 
 @app.post("/api/orders", status_code=201)
